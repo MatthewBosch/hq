@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, net::SocketAddr, ops::{ControlFlow, Div, Mul}, path::Path, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet, VecDeque}, net::SocketAddr, ops::{ControlFlow, Div, Mul}, path::Path, str::FromStr, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use axum::{extract::{ws::{Message, WebSocket}, ConnectInfo, Query, State, WebSocketUpgrade}, http::StatusCode, response::IntoResponse, routing::get, Extension, Router};
 use axum_extra::{headers::authorization::Basic, TypedHeader};
@@ -15,11 +15,13 @@ use tokio::{io::AsyncReadExt, sync::{mpsc::{UnboundedReceiver, UnboundedSender},
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use std::process::Command;
+use std::ops::Range;
 
 
 const MIN_DIFF: u32 = 8;
 const MIN_HASHPOWER: u64 = 5;
-
+const HIGH_DIFFICULTY_THRESHOLD: u32 = 16;
 
 struct AppState {
     sockets: HashMap<SocketAddr, (Pubkey, Mutex<SplitSink<WebSocket, Message>>)>
@@ -37,17 +39,12 @@ pub struct MessageInternalMineSuccess {
 pub enum ClientMessage {
     Ready(SocketAddr),
     Mining(SocketAddr),
-    BestSolution(SocketAddr, Solution, Pubkey)
+    BestSolution(SocketAddr, Solution, Pubkey, [u8; 32])
 }
 
 pub struct EpochHashes {
-    best_hash: BestHash,
+    best_hashes: VecDeque<Solution>,
     submissions: HashMap<Pubkey, (u32, u64)>,
-}
-
-pub struct BestHash {
-    solution: Option<Solution>,
-    difficulty: u32,
 }
 
 pub struct Config {
@@ -78,6 +75,40 @@ struct Args {
     whitelist: Option<String>,
 }
 
+fn get_bus_data() -> Option<usize> {
+    let output = Command::new("ore")
+        .arg("busses")
+        .output()
+        .ok()?;
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    info!("Bus data:\n{}", output_str);
+
+    let mut max_bus = 0;
+    let mut max_value = 0.0;
+
+    for line in output_str.lines() {
+        if let Some((bus_str, value_str)) = line.split_once(':') {
+            if let (Ok(bus), Ok(value)) = (
+                bus_str.trim().split_whitespace().nth(1)?.parse::<usize>(),
+                value_str.trim().split_whitespace().next()?.parse::<f64>()
+            ) {
+                if value > max_value {
+                    max_value = value;
+                    max_bus = bus;
+                }
+            }
+        }
+    }
+
+    if max_value > 0.0 {
+        info!("Selected bus with highest balance: {} ({})", max_bus, max_value);
+        Some(max_bus)
+    } else {
+        error!("No valid bus data found");
+        None
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -194,10 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     let epoch_hashes = Arc::new(RwLock::new(EpochHashes {
-        best_hash: BestHash {
-            solution: None,
-            difficulty: 0,
-        },
+        best_hashes: VecDeque::new(),
         submissions: HashMap::new(),
     }));
 
@@ -228,7 +256,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_nonce = nonce_ext.clone();
     tokio::spawn(async move {
         loop {
-
             let mut clients = Vec::new();
             {
                 let ready_clients_lock = ready_clients.lock().await;
@@ -244,8 +271,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cutoff = get_cutoff(proof, 5);
             let mut should_mine = true;
             let cutoff = if cutoff <= 0 {
-                let solution = app_epoch_hashes.read().await.best_hash.solution;
-                if solution.is_some() {
+                let solutions = app_epoch_hashes.read().await.best_hashes.clone();
+                if !solutions.is_empty() {
                     should_mine = false;
                 }
                 0
@@ -271,12 +298,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // challenge is 256 bytes = 32 u8
                         // cutoff is 64 bytes = 8 u8
                         // nonce_range is 128 bytes, start is 64 bytes, end is 64 bytes = 16 u8
-                        let mut bin_data = [0; 57];
+                        let mut bin_data = [0; 25];
                         bin_data[00..1].copy_from_slice(&0u8.to_le_bytes());
-                        bin_data[01..33].copy_from_slice(&challenge);
-                        bin_data[33..41].copy_from_slice(&cutoff.to_le_bytes());
-                        bin_data[41..49].copy_from_slice(&nonce_range.start.to_le_bytes());
-                        bin_data[49..57].copy_from_slice(&nonce_range.end.to_le_bytes());
+                        bin_data[01..09].copy_from_slice(&cutoff.to_le_bytes());
+                        bin_data[09..17].copy_from_slice(&nonce_range.start.to_le_bytes());
+                        bin_data[17..25].copy_from_slice(&nonce_range.end.to_le_bytes());
 
 
                         if let Some(sender) = shared_state.sockets.get(&client) {
@@ -297,7 +323,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_proof = proof_ext.clone();
     let app_epoch_hashes = epoch_hashes.clone();
     let app_wallet = wallet_extension.clone();
-    let app_nonce = nonce_ext.clone();
     let app_prio_fee = priority_fee.clone();
     tokio::spawn(async move {
         loop {
@@ -307,132 +332,132 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let cutoff = get_cutoff(proof, 0);
             if cutoff <= 0 {
-                // process solutions
-                let solution = {
-                    app_epoch_hashes.read().await.best_hash.solution.clone()
+                // 处理解决方案
+                let solutions = {
+                    app_epoch_hashes.read().await.best_hashes.clone()
                 };
-                if let Some(solution) = solution {
+                if !solutions.is_empty() {
                     let signer = app_wallet.clone();
-                    let mut ixs = vec![];
-                    // TODO: set cu's
-                    let prio_fee = {
-                        app_prio_fee.lock().await.clone()
-                    };
+                    for solution in solutions {
+                        // 获取最新的区块哈希
+                        match rpc_client.get_latest_blockhash().await {
+                            Ok(recent_blockhash) => {
+                                let mut ixs = vec![];
+                                let prio_fee = {
+                                    app_prio_fee.lock().await.clone()
+                                };
 
-                    let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(480000);
-                    ixs.push(cu_limit_ix);
+                                let cu_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(480000);
+                                ixs.push(cu_limit_ix);
 
-                    let prio_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(prio_fee);
-                    ixs.push(prio_fee_ix);
+                                let prio_fee_ix = ComputeBudgetInstruction::set_compute_unit_price(prio_fee);
+                                ixs.push(prio_fee_ix);
 
-                    let noop_ix = get_auth_ix(signer.pubkey());
-                    ixs.push(noop_ix);
+                                let noop_ix = get_auth_ix(signer.pubkey());
+                                ixs.push(noop_ix);
 
-                    // TODO: choose the highest balance bus
-                    let bus = rand::thread_rng().gen_range(0..BUS_COUNT);
-                    let difficulty = solution.to_hash().difficulty();
+                                // 选择余额最高的 bus 或使用随机 bus
+                                let bus = match get_bus_data() {
+                                    Some(b) => b,
+                                    None => {
+                                        let random_bus = rand::thread_rng().gen_range(0..BUS_COUNT);
+                                        info!("Failed to get bus data, using random bus: {}", random_bus);
+                                        random_bus
+                                    }
+                                };
 
-                    let ix_mine = get_mine_ix(signer.pubkey(), solution, bus);
-                    ixs.push(ix_mine);
-                    info!("Starting mine submission attempts with difficulty {}.", difficulty);
-                    if let Ok((hash, _slot)) = rpc_client.get_latest_blockhash_with_commitment(rpc_client.commitment()).await {
-                        let mut tx = Transaction::new_with_payer(&ixs, Some(&signer.pubkey()));
+                                let difficulty = solution.to_hash().difficulty();
+                                info!("Using bus: {}, Difficulty: {}", bus, difficulty);
 
-                        tx.sign(&[&signer], hash);
-                        
-                        for i in 0..3 {
-                            info!("Sending signed tx...");
-                            info!("attempt: {}", i + 1);
-                            let sig = rpc_client.send_and_confirm_transaction(&tx).await;
-                            if let Ok(sig) = sig {
-                                // success
-                                info!("Success!!");
-                                info!("Sig: {}", sig);
-                                // update proof
-                                loop {
-                                    if let Ok(loaded_proof) = get_proof(&rpc_client, signer.pubkey()).await {
-                                        if proof != loaded_proof {
-                                            info!("Got new proof.");
-                                            let balance = (loaded_proof.balance as f64) / 10f64.powf(ORE_TOKEN_DECIMALS as f64);
-                                            info!("New balance: {}", balance);
-                                            let rewards = loaded_proof.balance - proof.balance;
-                                            let rewards = (rewards as f64) / 10f64.powf(ORE_TOKEN_DECIMALS as f64);
-                                            info!("Earned: {} ORE", rewards);
+                                let ix_mine = get_mine_ix(signer.pubkey(), solution, bus);
+                                ixs.push(ix_mine);
+                                
+                                info!("Starting mine submission attempts with difficulty {}.", difficulty);
+                                let mut tx = Transaction::new_with_payer(&ixs, Some(&signer.pubkey()));
+                                tx.sign(&[&signer], recent_blockhash);
+                                
+                                for i in 0..6 {  // 增加到6次尝试
+                                    info!("Sending signed tx...");
+                                    info!("attempt: {}", i + 1);
+                                    match rpc_client.send_and_confirm_transaction(&tx).await {
+                                        Ok(sig) => {
+                                            // 成功
+                                            info!("Success!!");
+                                            info!("Sig: {}", sig);
+                                            // 更新 proof
+                                            loop {
+                                                if let Ok(loaded_proof) = get_proof(&rpc_client, signer.pubkey()).await {
+                                                    if proof != loaded_proof {
+                                                        info!("Got new proof.");
+                                                        let balance = (loaded_proof.balance as f64) / 10f64.powf(ORE_TOKEN_DECIMALS as f64);
+                                                        info!("New balance: {}", balance);
+                                                        let rewards = loaded_proof.balance - proof.balance;
+                                                        let rewards = (rewards as f64) / 10f64.powf(ORE_TOKEN_DECIMALS as f64);
+                                                        info!("Earned: {} ORE", rewards);
 
-                                            let submissions = {
-                                                app_epoch_hashes.read().await.submissions.clone()
-                                            };
+                                                        let submissions = {
+                                                            app_epoch_hashes.read().await.submissions.clone()
+                                                        };
 
-                                            let mut total_hashpower: u64 = 0;
-                                            for submission in submissions.iter() {
-                                                total_hashpower += submission.1.1
+                                                        let mut total_hashpower: u64 = 0;
+                                                        for submission in submissions.iter() {
+                                                            total_hashpower += submission.1.1
+                                                        }
+
+                                                        let _ = mine_success_sender.send(MessageInternalMineSuccess {
+                                                            difficulty,
+                                                            total_balance: balance,
+                                                            rewards,
+                                                            total_hashpower,
+                                                            submissions,
+                                                        });
+
+                                                        {
+                                                            let mut mut_proof = app_proof.lock().await;
+                                                            *mut_proof = loaded_proof;
+                                                            break;
+                                                        }
+                                                    }
+                                                } else {
+                                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                                }
                                             }
-
-                                            let _ = mine_success_sender.send(MessageInternalMineSuccess {
-                                                difficulty,
-                                                total_balance: balance,
-                                                rewards,
-                                                total_hashpower,
-                                                submissions,
-                                            });
-
-                                            {
-                                                let mut mut_proof = app_proof.lock().await;
-                                                *mut_proof = loaded_proof;
+                                            
+                                            // 成功后不需要额外延迟，直接处理下一个解决方案
+                                            break;
+                                        },
+                                        Err(e) => {
+                                            // 发送错误
+                                            if i >= 5 {  // 最后一次尝试失败
+                                                info!("Failed to send after 6 attempts. Error: {:?}", e);
                                                 break;
                                             }
                                         }
-                                    } else {
-                                        tokio::time::sleep(Duration::from_millis(500)).await;
                                     }
+                                    // 在重试之间增加一些延迟，但不要太长
+                                    tokio::time::sleep(Duration::from_secs(3)).await;
                                 }
-                                // reset nonce
-                                {
-                                    let mut nonce = app_nonce.lock().await;
-                                    *nonce = 0;
-                                }
-                                // reset epoch hashes
-                                {
-                                    info!("reset epoch hashes");
-                                    let mut mut_epoch_hashes = app_epoch_hashes.write().await;
-                                    mut_epoch_hashes.best_hash.solution = None;
-                                    mut_epoch_hashes.best_hash.difficulty = 0;
-                                    mut_epoch_hashes.submissions = HashMap::new();
-                                }
-                                break;
-                            } else {
-                                // sent error
-                                if i >= 2 {
-                                    info!("Failed to send after 3 attempts. Discarding and refreshing data.");
-                                    // reset nonce
-                                    {
-                                        let mut nonce = app_nonce.lock().await;
-                                        *nonce = 0;
-                                    }
-                                    // reset epoch hashes
-                                    {
-                                        info!("reset epoch hashes");
-                                        let mut mut_epoch_hashes = app_epoch_hashes.write().await;
-                                        mut_epoch_hashes.best_hash.solution = None;
-                                        mut_epoch_hashes.best_hash.difficulty = 0;
-                                        mut_epoch_hashes.submissions = HashMap::new();
-                                    }
-                                    break;
-                                }
+                            },
+                            Err(e) => {
+                                error!("Failed to get latest blockhash: {:?}", e);
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                continue;
                             }
-                            tokio::time::sleep(Duration::from_millis(500)).await;
                         }
-                    } else {
-                        error!("Failed to get latest blockhash. retrying...");
-                        tokio::time::sleep(Duration::from_millis(1000)).await;
+                    }
+                    // 重置 epoch hashes
+                    {
+                        info!("reset epoch hashes");
+                        let mut mut_epoch_hashes = app_epoch_hashes.write().await;
+                        mut_epoch_hashes.best_hashes.clear();
+                        mut_epoch_hashes.submissions = HashMap::new();
                     }
                 }
             } else {
                 tokio::time::sleep(Duration::from_secs(cutoff as u64)).await;
-            };
+            }
         }
     });
-
 
     let app_shared_state = shared_state.clone();
     tokio::spawn(async move {
@@ -462,7 +487,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("Failed to send client text");
                             }
                         }
-
                     }
                 }
             }
@@ -473,7 +497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_shared_state = shared_state.clone();
     let app = Router::new()
         .route("/", get(ws_handler))
-        .with_state(app_shared_state)
+        .with_state(app_shared_state.clone())
         .layer(Extension(config))
         .layer(Extension(wallet_extension))
         .layer(Extension(client_channel))
@@ -483,14 +507,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .make_span_with(DefaultMakeSpan::default().include_headers(true))
         );
 
-
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
         .unwrap();
 
     tracing::debug!("listening on {}", listener.local_addr().unwrap());
 
-    let app_shared_state = shared_state.clone();
     tokio::spawn(async move {
         ping_check_system(&app_shared_state).await;
     });
@@ -518,23 +540,17 @@ async fn ws_handler(
     Extension(client_channel): Extension<UnboundedSender<ClientMessage>>,
     query_params: Query<WsQueryParams>
 ) -> impl IntoResponse {
-
     let msg_timestamp = query_params.timestamp;
 
     let pubkey = auth_header.username();
     let signed_msg = auth_header.password();
 
-    // TODO: Store pubkey data in db
-
-
     let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards").as_secs();
 
-    // Signed authentication message is only valid for 5 seconds
     if (now - query_params.timestamp) >= 5 {
         return Err((StatusCode::UNAUTHORIZED, "Timestamp too old."));
     }
 
-    // verify client
     if let Ok(pubkey) = Pubkey::from_str(pubkey) {
         if let Some(whitelist) = &app_config.lock().await.whitelist {
             if whitelist.contains(&pubkey) {
@@ -570,16 +586,19 @@ async fn ws_handler(
     } else {
         return Err((StatusCode::UNAUTHORIZED, "Invalid pubkey"));
     }
-
 }
 
-async fn handle_socket(mut socket: WebSocket, who: SocketAddr, who_pubkey: Pubkey, rw_app_state: Arc<RwLock<AppState>>, client_channel: UnboundedSender<ClientMessage>) {
+async fn handle_socket(
+    mut socket: WebSocket,
+    who: SocketAddr,
+    who_pubkey: Pubkey,
+    rw_app_state: Arc<RwLock<AppState>>,
+    client_channel: UnboundedSender<ClientMessage>
+) {
     if socket.send(axum::extract::ws::Message::Ping(vec![1, 2, 3])).await.is_ok() {
         println!("Pinged {who}...");
     } else {
         println!("could not ping {who}");
-
-        // if we can't ping we can't do anything, return to close the connection
         return;
     }
 
@@ -614,7 +633,6 @@ fn process_message(msg: Message, who: SocketAddr, client_channel: UnboundedSende
             println!(">>> {who} sent str: {t:?}");
         },
         Message::Binary(d) => {
-            // first 8 bytes are message type
             let message_type = d[0];
             match message_type {
                 0 => {
@@ -634,8 +652,10 @@ fn process_message(msg: Message, who: SocketAddr, client_channel: UnboundedSende
 
                     let ts = u64::from_le_bytes(ts);
 
-                    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards").as_secs();
-
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("Time went backwards")
+                        .as_secs();
 
                     let time_since = now - ts;
                     if time_since > 5 {
@@ -651,16 +671,13 @@ fn process_message(msg: Message, who: SocketAddr, client_channel: UnboundedSende
                     let _ = client_channel.send(msg);
                 },
                 2 => {
-                    // parse solution from message data
                     let mut solution_bytes = [0u8; 16];
-                    // extract (16 u8's) from data for hash digest
                     let mut b_index = 1;
                     for i in 0..16 {
                         solution_bytes[i] = d[i + b_index];
                     }
                     b_index += 16;
 
-                    // extract 64 bytes (8 u8's)
                     let mut nonce = [0u8; 8];
                     for i in 0..8 {
                         nonce[i] = d[i + b_index];
@@ -671,7 +688,13 @@ fn process_message(msg: Message, who: SocketAddr, client_channel: UnboundedSende
                     for i in 0..32 {
                         pubkey[i] = d[i + b_index];
                     }
+                    b_index += 32;
 
+                    // Extract challenge from the message
+                    let mut challenge = [0u8; 32];
+                    for i in 0..32 {
+                        challenge[i] = d[i + b_index];
+                    }
                     b_index += 32;
 
                     let signature_bytes = d[b_index..].to_vec();
@@ -686,27 +709,22 @@ fn process_message(msg: Message, who: SocketAddr, client_channel: UnboundedSende
                             if sig.verify(&pubkey.to_bytes(), &hash_nonce_message) {
                                 let solution = Solution::new(solution_bytes, nonce);
 
-                                let msg = ClientMessage::BestSolution(who, solution, pubkey);
+                                let msg = ClientMessage::BestSolution(who, solution, pubkey, challenge);
                                 let _ = client_channel.send(msg);
                             } else {
                                 error!("Client submission sig verification failed.");
                             }
-
                         } else {
                             error!("Failed to parse into Signature.");
                         }
-
-
                     } else {
                         error!("Failed to parse signed message from client.");
                     }
-
                 },
                 _ => {
                     println!(">>> {} sent an invalid message", who);
                 }
             }
-
         },
         Message::Close(c) => {
             if let Some(cf) = c {
@@ -719,12 +737,8 @@ fn process_message(msg: Message, who: SocketAddr, client_channel: UnboundedSende
             }
             return ControlFlow::Break(())
         },
-        Message::Pong(_v) => {
-            //println!(">>> {who} sent pong with {v:?}");
-        },
-        Message::Ping(_v) => {
-            //println!(">>> {who} sent ping with {v:?}");
-        },
+        Message::Pong(_v) => {},
+        Message::Ping(_v) => {},
     }
 
     ControlFlow::Continue(())
@@ -759,13 +773,9 @@ async fn client_message_handler_system(
             ClientMessage::Mining(addr) => {
                 println!("Client {} has started mining!", addr.to_string());
             },
-            ClientMessage::BestSolution(_addr, solution, pubkey) => {
+            ClientMessage::BestSolution(_addr, solution, pubkey, challenge) => {
                 let pubkey_str = pubkey.to_string();
-                let challenge = {
-                    let proof = proof.lock().await;
-                    proof.challenge
-                };
-
+            
                 if solution.is_valid(&challenge) {
                     let diff = solution.to_hash().difficulty();
                     println!("{} found diff: {}", pubkey_str, diff);
@@ -775,14 +785,20 @@ async fn client_message_handler_system(
                         {
                             let mut epoch_hashes = epoch_hashes.write().await;
                             epoch_hashes.submissions.insert(pubkey, (diff, hashpower));
-                            if diff > epoch_hashes.best_hash.difficulty {
-                                epoch_hashes.best_hash.difficulty = diff;
-                                epoch_hashes.best_hash.solution = Some(solution);
+                            if diff > HIGH_DIFFICULTY_THRESHOLD {
+                                epoch_hashes.best_hashes.push_back(solution);
+                                while epoch_hashes.best_hashes.len() > 10 {
+                                    epoch_hashes.best_hashes.pop_front();
+                                }
+                            } else {
+                                if epoch_hashes.best_hashes.is_empty() || diff > epoch_hashes.best_hashes[0].to_hash().difficulty() {
+                                    epoch_hashes.best_hashes.clear();
+                                    epoch_hashes.best_hashes.push_back(solution);
+                                }
                             }
                         }
-
                     } else {
-                        println!("Diff to low, skipping");
+                        println!("Diff too low, skipping");
                     }
                 } else {
                     println!("{} returned an invalid solution!", pubkey);
